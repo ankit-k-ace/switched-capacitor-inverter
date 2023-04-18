@@ -1,0 +1,438 @@
+#include "math.h"
+#include "IQmathlib.h"
+#include "DSP2833x_Device.h"     // DSP2833x Headerfile Include File
+#include "DSP2833x_Examples.h"   // DSP2833x Examples Include File
+
+
+
+// Prototype statements for functions found within this file.
+void InitEPwmTimer(void);
+interrupt void cpu_timer0_isr(void);
+
+// Global variables used in this example
+Uint32  CpuTimer0IntCount = 1;
+float duty = 0.405, omega_standalone = 2*3.14159*50, ref_sine = 0, time = 0, ref_sine_offset = 0, wt = 0, wt_offset = 0;
+float ref_sine_n = 0, ref_sine_offset_n = 0, amp = 1, phase_delay = 0, phase_delay1 = 0, phase_delay2 = 0, phase_delay3 = 0, phase_delay4 = 0;
+float voltage_grid = 0, voltage_pv = 0, current_grid = 0, current_pv = 0, voltage_offset = 0;
+float vg1 = 0, vpv1 = 0, cg1 = 0, cpv1 = 0, voft1 = 0;
+
+// Variables used for plotting
+int plot_count = 1, sample = 0;
+float array_sine[250][4];
+
+// Variables used for PLL
+float vg_alpha_new = 0, vg_beta_dash_new = 0, omega_new = 0, omega_old = 0;
+float vg_d_new = 0, vg_d_old = 0, vg_q_new = 0, vg_q_old = 0, theta_new = 0, theta_old = 0, theta_mod = 0;
+float vg_d_filtered_new = 0, vg_d_filtered_old = 0, vg_q_filtered_new = 0, vg_q_filtered_old = 0;
+float error_vg_d_new = 0, error_vg_d_old = 0, cos_theta = 0, sin_theta =0;
+float kp_pll = 0.5, ki_pll = 0.4, k_clamp_gain_pll = 2;
+float x1 = 0, x2 = 0, x3 = 0, x4 = 0, x5 = 0, x6 = 0;
+float omega_estimated_new = 0, omega_estimated_old = 0, omega_estimated_sat = 0, omega_forwarded_new = 0, omega_forwarded_old = 0;
+float wn=70.7;
+float omega_feedforward = 2*3.14159*50, loop_sample_time = 20e-6, omega_lpf = 0;
+int pll_mode = 0;
+float gain = 1;
+float td1 = 0, td2 = 0, td3 = 0, td4 = 0, td5 = 0;
+
+void main(void)
+{
+    InitSysCtrl();
+    DINT;   // disable CPU interrupts
+    InitPieCtrl();  // disable all peripheral interrupts
+    EALLOW;
+    SysCtrlRegs.PCLKCR0.bit.TBCLKSYNC = 0;      // Stop all the TB clocks
+    EDIS;
+    InitEPwmTimer();    // initiate the required ePWM registers and configure interrupt requirements
+    EALLOW;
+    SysCtrlRegs.PCLKCR0.bit.TBCLKSYNC = 1;         // Start all the timers synced
+    EDIS;
+    IER = 0x0000;   // disables all interrupts
+    IFR = 0x0000;   // clears flags of all interrupts
+    InitPieVectTable();
+
+
+//************ADC INITIALISATION and CONFIGURATION BEGINS************//
+    InitAdc();                               // basic ADC setup (including calibration)
+
+    AdcRegs.ADCTRL1.all = 0;                 // clear ADCTRL1 before initializing
+    AdcRegs.ADCTRL1.bit.ACQ_PS = 0xf;        // sample and hold for (15+1)=16 ADC cycles
+    AdcRegs.ADCTRL1.bit.CPS = 0;             // divide further by 1
+    AdcRegs.ADCTRL1.bit.SEQ_CASC = 1;        // cascaded mode for ADC (16 states)
+    AdcRegs.ADCTRL1.bit.CONT_RUN = 0;        // continuous run mode for ADC disabled
+
+    AdcRegs.ADCTRL2.bit.INT_ENA_SEQ1 = 1;      // enable interrupt on SEQ1
+    AdcRegs.ADCTRL2.bit.INT_MOD_SEQ1 = 0;    // enable interrupt every end of sequence
+    AdcRegs.ADCTRL2.bit.RST_SEQ1 = 1;        // reset SEQ1
+    AdcRegs.ADCTRL2.bit.SOC_SEQ1 = 1;        // start SEQ1
+
+
+    AdcRegs.ADCTRL3.bit.SMODE_SEL = 0;       // sequential simultaneous conversion for ADC
+    AdcRegs.ADCTRL3.bit.ADCCLKPS = 3;        // 3 because HSPCLK for ADC is 75 Mhz (150/6); see above
+                                             // from DSP2833x_SysCtrl.c FCLK for ADC is 75 MHz and not 150 MHz;
+                                             // 75/(2*3) = 12.5 MHz
+
+    AdcRegs.ADCMAXCONV.all = 0x0001;              // 2 conversions
+    AdcRegs.ADCCHSELSEQ1.bit.CONV00 = 0x2;     // assign ADCINA2 to conv00
+    AdcRegs.ADCCHSELSEQ1.bit.CONV01 = 0x3;     // assign ADCINA3 to conv02
+
+//************ADC INITIALISATION and CONFIGURATION ENDS************//
+
+
+
+
+    EALLOW;  // This is needed to write to EALLOW protected registers
+    PieVectTable.TINT0 = &cpu_timer0_isr;
+    EDIS;
+
+    InitCpuTimers();
+    ConfigCpuTimer(&CpuTimer0, 150, 20); // generate TINT0 at 25 us or 40 kHz
+    CpuTimer0Regs.TCR.all = 0x4001;
+
+
+
+
+    IER |=1; // enable timer0 interrupt
+    IER |=4; // enable INT3 for ePWM3 and ePWM5
+    /* Enable TINT0
+    */
+    PieCtrlRegs.PIEIER1.bit.INTx7=1;
+
+// Enable global Interrupts and higher priority real-time debug events:
+    EINT;   // Enable Global interrupt INTM
+    ERTM;   // Enable Global realtime interrupt DBGM
+
+}
+
+void InitEPwmTimer(void)
+{
+    EALLOW;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 1; // ePWM1A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 1; // ePWM1B active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 1; // ePWM2A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO3 = 1; // ePWM2B active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO4 = 1; // ePWM3A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO5 = 1; // ePWM3B active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO6 = 1; // ePWM4A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO7 = 1; // ePEM4B active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO8 = 1; // ePWM5A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO9 = 1; // ePWM5B active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO10 = 1; // ePWM6A active
+    GpioCtrlRegs.GPAMUX1.bit.GPIO11 = 1; // ePWM6B active
+    EDIS;
+
+    EALLOW;
+    GpioCtrlRegs.GPBMUX2.bit.GPIO60 = 0; // select GPIO 60 as GPIO
+    GpioCtrlRegs.GPBMUX2.bit.GPIO61 = 0; // select GPIO 61 as GPIO
+    GpioCtrlRegs.GPBDIR.bit.GPIO60 = 1; // make GPIO 60 as output
+    GpioCtrlRegs.GPBDIR.bit.GPIO61 = 1; // make GPIO 61 as output
+    EDIS;
+
+
+//      ePWM 1, and 2 module clock sync disabled
+    EPwm1Regs.TBCTL.bit.SYNCOSEL = 3;    // disable sync
+    EPwm2Regs.TBCTL.bit.SYNCOSEL = 3;    // disable sync
+
+//      ePWM 3, 4, 5, and 6 module clock sync
+    EPwm3Regs.TBCTL.bit.SYNCOSEL = 1;    // generate a syncout if CTR = 0
+    EPwm4Regs.TBCTL.bit.SYNCOSEL = 0;    // syncin = syncout
+    EPwm5Regs.TBCTL.bit.SYNCOSEL = 0;    // syncin = syncout
+    EPwm6Regs.TBCTL.bit.SYNCOSEL = 0;    // syncin = syncout
+
+
+//      ePWM 3, 4, 5, and 6 timer sync and timer direction
+    EPwm4Regs.TBCTL.bit.PHSEN = 1;       // enable phase shift for ePWM2
+    EPwm4Regs.TBPHS.half.TBPHS = 0;      // zero phase shift
+    EPwm4Regs.TBCTL.bit.PHSDIR = 1;      // count up after synchronisation for ePWM2
+    EPwm5Regs.TBCTL.bit.PHSEN = 1;       // enable phase shift for ePWM2
+    EPwm5Regs.TBPHS.half.TBPHS = 3750;      // zero phase shift
+    EPwm5Regs.TBCTL.bit.PHSDIR = 1;      // count up after synchronisation for ePWM2
+    EPwm6Regs.TBCTL.bit.PHSEN = 1;       // enable phase shift for ePWM2
+    EPwm6Regs.TBPHS.half.TBPHS = 3750;      // zero phase shift
+    EPwm6Regs.TBCTL.bit.PHSDIR = 1;      // count up after synchronisation for ePWM2
+
+//      ePWM1 HRPWM INITIALISATIONS
+    EPwm1Regs.TBCTL.bit.PRDLD = 1;
+    EPwm1Regs.TBCTL.bit.PHSEN = 0;
+    EPwm1Regs.TBCTL.bit.CLKDIV =  0;                // CLKDIV = 1
+    EPwm1Regs.TBCTL.bit.HSPCLKDIV = 0;              // HSPCLKDIV = 1
+    EPwm1Regs.TBCTL.bit.CTRMODE = 0;                // up mode
+    EPwm1Regs.CMPCTL.bit.LOADAMODE = 0;  // LOAD CMPA on CTR = 0 or PRD
+    EPwm1Regs.CMPCTL.bit.SHDWAMODE = 0;  // shadow mode ON on CMPA
+    EPwm1Regs.CMPCTL.bit.LOADBMODE = 0;  // LOAD CMPB on CTR = 0 or PRD
+    EPwm1Regs.CMPCTL.bit.SHDWBMODE = 0;  // shadow mode ON on CMPB
+    EPwm1Regs.AQCTLA.all = 0x0012;                  // clear ePWM1A on CMPA up
+                                                    // set ePWM1A on CTR = 0
+    EPwm1Regs.AQCTLB.all = 0x0102;                  // clear ePWM1B on CMPA up
+                                                    // set ePWM1B on CTR = 0
+    EPwm1Regs.TBPRD = 300;                          // timer period for 500 KHz
+                                                    // TBPRD = (150M)/(500k*1*1)
+//    duty_cmpa_int_1a = ((int)(duty*EPwm1Regs.TBPRD));         // integer part of duty*TBPRD
+//    duty_cmpahr_val_1a = duty*EPwm1Regs.TBPRD - duty_cmpa_int_1a;  // fraction part of duty*TBPRD
+    EPwm1Regs.CMPA.half.CMPA = duty*EPwm1Regs.TBPRD;            // value of CMPA for ePWM1A
+    EPwm1Regs.CMPA.half.CMPAHR = ((duty*EPwm1Regs.TBPRD-(int)(duty*EPwm1Regs.TBPRD))*37 + 1.5)*256;    // mep_scalefactor is taken as 37
+                                                                          //at a step-size of 180ps (1/(150 M))/(180 ps)
+
+    EPwm1Regs.CMPB = 121.5;                           // 50% duty cycle
+
+    EALLOW;
+    EPwm1Regs.HRCNFG.all = 0x0;                     // clears all bits of HRCNFG
+    EPwm1Regs.HRCNFG.bit.EDGMODE = 2;          //MEP control on falling edge
+    EPwm1Regs.HRCNFG.bit.CTLMODE = 0;           // CMPAHR controls HRPWM
+    EPwm1Regs.HRCNFG.bit.HRLOAD  = 0;           // load on CTR = 0
+    EDIS;
+
+//      ePWM2 HRPWM INITIALISATIONS
+    EPwm2Regs.TBCTL.bit.PRDLD =1;
+    EPwm2Regs.TBCTL.bit.PHSEN = 0;
+    EPwm2Regs.TBCTL.bit.CLKDIV =  0;                // CLKDIV = 1
+    EPwm2Regs.TBCTL.bit.HSPCLKDIV = 0;              // HSPCLKDIV = 1
+    EPwm2Regs.TBCTL.bit.CTRMODE = 0;                // up mode
+    EPwm2Regs.CMPCTL.bit.LOADAMODE = 0;  // LOAD CMPA on CTR = 0 or PRD
+    EPwm2Regs.CMPCTL.bit.SHDWAMODE = 0;  // shadow mode ON on CMPA
+    EPwm2Regs.CMPCTL.bit.LOADBMODE = 0;  // LOAD CMPB on CTR = 0 or PRD
+    EPwm2Regs.CMPCTL.bit.SHDWBMODE = 0;  // shadow mode ON on CMPB
+    EPwm2Regs.AQCTLA.all = 0x0012;                  // clear ePWM2A on CMPA up
+                                                    // set ePWM2A on CTR = 0
+    EPwm2Regs.AQCTLB.all = 0x0102;                  // clear ePWM2B on CMPA up
+                                                    // set ePWM2B on CTR = 0
+    EPwm2Regs.TBPRD = 150;                          // timer period for 1 MHz
+                                                    // TBPRD = (150M)/(150M*1*1)
+//    duty_cmpa_int_1a = ((int)(duty*EPwm1Regs.TBPRD));         // integer part of duty*TBPRD
+//    duty_cmpahr_val_1a = duty*EPwm1Regs.TBPRD - duty_cmpa_int_1a;  // fraction part of duty*TBPRD
+    EPwm2Regs.CMPA.half.CMPA = duty*EPwm2Regs.TBPRD;            // value of CMPA for ePWM1A
+    EPwm2Regs.CMPA.half.CMPAHR = ((duty*EPwm2Regs.TBPRD-(int)(duty*EPwm2Regs.TBPRD))*37 + 1.5)*256;    // mep_scalefactor is taken as 37
+                                                                              //at a step-size of 180ps (1/(150 M))/(180 ps)
+
+    EPwm2Regs.CMPB = 60.75;                           // 50% duty cycle
+    EALLOW;
+    EPwm2Regs.HRCNFG.all = 0x0;                     // clears all bits of HRCNFG
+    EPwm2Regs.HRCNFG.bit.EDGMODE = 2;          //MEP control on falling edge
+    EPwm2Regs.HRCNFG.bit.CTLMODE = 0;           // CMPAHR controls HRPWM
+    EPwm2Regs.HRCNFG.bit.HRLOAD  = 0;           // load on CTR = 0
+    EDIS;
+
+//      ePWM3 INITIALISATIONS
+    EPwm3Regs.TBCTL.bit.PHSEN = 0;
+    EPwm3Regs.TBCTL.bit.CLKDIV =  0;     // CLKDIV = 1
+    EPwm3Regs.TBCTL.bit.HSPCLKDIV = 1;   // HSPCLKDIV = 2
+    EPwm3Regs.TBCTL.bit.CTRMODE = 2;     // up - down mode
+    EPwm3Regs.AQCTLA.all = 0x0090;       // clear ePWM1A on CMPA up
+                                         // set ePWM1A on CMPA down
+    EPwm3Regs.AQCTLB.all = 0x0900;       // clear ePWM1B on CMPA up
+                                         // set ePWM1B on CMPA down
+    EPwm3Regs.TBPRD = 3750;              // timer period for 10 KHz
+                                         // TBPRD = (150M)/(2*10k*1*2)
+    EPwm3Regs.ETSEL.all = 0;
+    EPwm3Regs.ETSEL.bit.INTEN = 1;       // interrupt enable for ePWM1
+    EPwm3Regs.ETSEL.bit.INTSEL = 7;      // interrupt on CTRD = CMPB
+    EPwm3Regs.ETPS.bit.INTPRD = 1;       // interrupt on first event
+//      ePWM4 INITIALISATIONS
+    EPwm4Regs.TBCTL.bit.CLKDIV =  0;     // CLKDIV = 1
+    EPwm4Regs.TBCTL.bit.HSPCLKDIV = 1;   // HSPCLKDIV = 2
+    EPwm4Regs.TBCTL.bit.CTRMODE = 2;     // up - down mode
+    EPwm4Regs.AQCTLA.all = 0x0090;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm4Regs.AQCTLB.all = 0x0900;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm4Regs.TBPRD = 3750;              // timer period for 10 KHz
+                                         // TBPRD = (150M)/(2*10k*1*2)
+    EPwm4Regs.CMPCTL.bit.LOADAMODE = 3;  // LOAD CMPA on CTR = 0 or PRD
+    EPwm4Regs.CMPCTL.bit.SHDWAMODE = 1;  // shadow mode ON on CMPA
+    EPwm4Regs.CMPCTL.bit.LOADBMODE = 3;  // LOAD CMPB on CTR = 0 or PRD
+    EPwm4Regs.CMPCTL.bit.SHDWBMODE = 1;  // shadow mode ON on CMPB
+    EPwm4Regs.AQCTLA.all = 0x0090;       // clear ePWM1A on CMPA up
+                                         // set ePWM3A on CMPA down
+    EPwm4Regs.AQCTLB.all = 0x0900;       // clear ePWM3B on CMPA up
+                                         // set ePWM3B on CMPA down
+//      ePWM5 INITIALISATIONS
+    EPwm5Regs.TBCTL.bit.CLKDIV =  0;     // CLKDIV = 1
+    EPwm5Regs.TBCTL.bit.HSPCLKDIV = 1;   // HSPCLKDIV = 2
+    EPwm5Regs.TBCTL.bit.CTRMODE = 2;     // up - down mode
+    EPwm5Regs.AQCTLA.all = 0x0090;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm5Regs.AQCTLB.all = 0x0900;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm5Regs.TBPRD = 3750;              // timer period for 10 KHz
+                                         // TBPRD = (150M)/(2*10k*1*2)
+    EPwm5Regs.CMPCTL.bit.LOADAMODE = 3;  // LOAD CMPA on CTR = 0 or PRD
+    EPwm5Regs.CMPCTL.bit.SHDWAMODE = 1;  // shadow mode ON on CMPA
+    EPwm5Regs.CMPCTL.bit.LOADBMODE = 3;  // LOAD CMPB on CTR = 0 or PRD
+    EPwm5Regs.CMPCTL.bit.SHDWBMODE = 1;  // shadow mode ON on CMPB
+    EPwm5Regs.AQCTLA.all = 0x0090;       // clear ePWM1A on CMPA up
+                                         // set ePWM3A on CMPA down
+    EPwm5Regs.AQCTLB.all = 0x0900;       // clear ePWM3B on CMPA up
+                                         // set ePWM3B on CMPA down
+    EPwm5Regs.ETSEL.all = 0;
+    EPwm5Regs.ETSEL.bit.INTEN = 1;       // interrupt enable for ePWM1
+    EPwm5Regs.ETSEL.bit.INTSEL = 7;      // interrupt on CTRD = CMPB
+    EPwm5Regs.ETPS.bit.INTPRD = 1;       // interrupt on first event
+//      ePWM6 INITIALISATIONS
+    EPwm6Regs.TBCTL.bit.CLKDIV =  0;     // CLKDIV = 1
+    EPwm6Regs.TBCTL.bit.HSPCLKDIV = 1;   // HSPCLKDIV = 2
+    EPwm6Regs.TBCTL.bit.CTRMODE = 2;     // up - down mode
+    EPwm6Regs.AQCTLA.all = 0x0090;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm6Regs.AQCTLB.all = 0x0900;       // clear ePWM2A on CMPA up
+                                         // set ePWM2A on CMPA down
+    EPwm6Regs.TBPRD = 3750;              // timer period for 10 KHz
+                                         // TBPRD = (150M)/(2*10k*1*2)
+    EPwm6Regs.CMPCTL.bit.LOADAMODE = 3;  // LOAD CMPA on CTR = 0 or PRD
+    EPwm6Regs.CMPCTL.bit.SHDWAMODE = 1;  // shadow mode ON on CMPA
+    EPwm6Regs.CMPCTL.bit.LOADBMODE = 3;  // LOAD CMPB on CTR = 0 or PRD
+    EPwm6Regs.CMPCTL.bit.SHDWBMODE = 1;  // shadow mode ON on CMPB
+    EPwm6Regs.AQCTLA.all = 0x0090;       // clear ePWM1A on CMPA up
+                                         // set ePWM3A on CMPA down
+    EPwm6Regs.AQCTLB.all = 0x0900;       // clear ePWM3B on CMPA up
+                                         // set ePWM3B on CMPA down
+}
+
+interrupt void cpu_timer0_isr(void)
+{
+    omega_lpf = 2*3.14159*wn;
+    CpuTimer0IntCount++;
+
+//****************************READ VALUES FROM ADC BEGINS****************************//
+    AdcRegs.ADCTRL2.bit.SOC_SEQ1 = 1;
+    voltage_grid = AdcRegs.ADCRESULT0>>4;            // read grid voltage from ADCINA2 into voltage_grid from ADCResult2 register
+    vg1 = (voltage_grid*3.0)/(4095.0);
+    current_grid = AdcRegs.ADCRESULT1>>4;            // read grid current from ADCINB2 into current_grid from ADCResult3 register
+    cg1 = (current_grid*3.0)/(4095.0);
+//    voltage_pv = AdcRegs.ADCRESULT6>>4;              // read pv voltage from ADCINA3 into voltage_pv from ADCResult6 register
+//    current_pv = AdcRegs.ADCRESULT7>>4;              // read pv current from ADCINB3 into current_pv from ADCResult7 register
+//    voltage_offset = AdcRegs.ADCRESULT8>>4;          // read reference voltage from ADCINA4 into voltage_offset from ADCResult8 register
+    AdcRegs.ADCST.bit.INT_SEQ1_CLR = 1;              // clear interrupt generated by SEQ1
+    AdcRegs.ADCTRL2.bit.RST_SEQ1 = 1;        // reset SEQ1
+//    AdcRegs.ADCST.bit.INT_SEQ2_CLR = 1;              // clear interrupt generated by SEQ2
+//****************************READ VALUES FROM ADC ENDS****************************//
+
+//    if (time > 0.02)
+//        time=0;
+//    wt = omega_standalone*time;
+//    wt_offset = omega_standalone*(time - 0.0001);    // offset of 100 microseconds for the second sine wave
+//    ref_sine = fabs((sin(wt)));
+//    ref_sine_n = amp*(cos(wt + phase_delay) + 0.1*sin(3*wt + phase_delay1) + 0.02*cos(5*wt + phase_delay2) + 0.3*sin(7*wt + phase_delay3) + 0.07*cos(9*wt + phase_delay4));
+//    vg1 = amp*cos(wt + phase_delay);
+//    ref_sine_offset = fabs(sin(wt_offset));
+//    ref_sine_offset_n = sin(wt_offset);
+
+//****************************PLL BEGINS****************************//
+// THIS IS inverse-PARK based PLL
+// BILINEAR TRANSFORMATION is used for LPF, PI, integrator or any other s-domain type transfer function
+// s = (2/Ts)*((z-1)/(z+1))
+
+// STEP 1: alpha/beta to d/q transformation
+//    if(pll_mode == 0) // use internal sine
+//    vg_alpha_new = ref_sine_n;
+//    else // use grid voltage
+    vg_alpha_new = (vg1-cg1)*amp;
+    vg_d_new = vg_alpha_new*cos_theta + vg_beta_dash_new*sin_theta;
+    vg_q_new = vg_beta_dash_new*cos_theta - vg_alpha_new*sin_theta;
+
+// STEP 2: LPF using BILINEAR TRANSFORM
+// v_filtered_new = v_filtered_old*(2-ts*wn)/(2+ts*wn) + (v_old + v_new)*(ts*wn)/(2+ts*wn)
+// new and old vg_d and vg_q are needed for this implementation
+// variables used are loop_sample_time, omega_lpf, vg_d_filtered_new, vg_d_filtered_old, vg_q_filtered_new, vg_q_filtered_old
+// variables used are x1, x2, x3
+    x1 = (2-(loop_sample_time*omega_lpf));
+    x2 = loop_sample_time*omega_lpf;
+    x3 = (2+(loop_sample_time*omega_lpf));
+    vg_d_filtered_new = (vg_d_filtered_old*x1 + x2*(vg_d_new + vg_d_old))/x3;
+    vg_q_filtered_new = (vg_q_filtered_old*x1 + x2*(vg_q_new + vg_q_old))/x3;
+
+// STEP 3: update variables for the next iteration
+    vg_d_old = vg_d_new;
+    vg_q_old = vg_q_new;
+    vg_d_filtered_old = vg_d_filtered_new;
+    vg_q_filtered_old = vg_q_filtered_new;
+
+// STEP 4: d/q to alpha/beta transformation
+// beta_dash is needed alone because alpha_new is obtained directly from ADC conversion
+    vg_beta_dash_new = vg_d_filtered_new*sin_theta + vg_q_filtered_new*cos_theta;
+
+// STEP 5: d component error calculation
+    error_vg_d_new = vg_d_new - 0;  // the d component must remain at 0 always
+
+// STEP 6: PI to obtain frequency (omega) in rad/sec using BILINEAR TRANSFORM
+    x4 = (kp_pll + ki_pll*loop_sample_time/2);
+    x5 = (-kp_pll + ki_pll*loop_sample_time/2);
+    x6 = omega_estimated_old + x4*error_vg_d_new + x5*error_vg_d_old;
+// STEP 6.1: PI with anti-wind loop
+    omega_estimated_sat = x6;
+    if (x6 > 2000)
+        omega_estimated_sat = 2000;
+    if (x6 < -2000)
+        omega_estimated_sat = -2000;
+    omega_estimated_new = x6 + k_clamp_gain_pll*(omega_estimated_sat - x6);
+    omega_forwarded_new = omega_estimated_new + omega_feedforward;
+
+
+// STEP 7: update variables for the next iteration
+    error_vg_d_old = error_vg_d_new;
+    omega_estimated_old = omega_estimated_new;
+
+// STEP 8: INTEGRATOR using BILINEAR TRANSFORM
+    theta_new = theta_old + 0.5*loop_sample_time*(omega_forwarded_new + omega_forwarded_old);
+// STEP 8.1: RESET theta after every 2*pi radians
+    if (theta_new > 2*3.14159)
+        theta_new = theta_new - 2*3.14159;
+    if (theta_new < 0)
+        theta_new = theta_new + 2*3.14159;
+    cos_theta = cos(theta_new);
+    sin_theta = sin(theta_new);
+
+// STEP 9: update variables for the next iteration
+    omega_forwarded_old = omega_forwarded_new;
+    theta_old = theta_new;
+    td5 = td4;
+    td4 = td3;
+    td3 = td2;
+    td2 = td1;
+    td1 = theta_new;
+
+//****************************PLL ENDS****************************//
+
+
+
+    ref_sine = fabs(sin_theta);
+    ref_sine_n = sin_theta;
+    ref_sine_offset = fabs(sin(td5));
+    EPwm3Regs.CMPA.half.CMPA = duty*ref_sine*EPwm3Regs.TBPRD;     // modulation index of 0.405 because duty is 0.405
+    EPwm3Regs.CMPB = ref_sine*0.75*EPwm3Regs.TBPRD;               // 75% modulation index
+    EPwm5Regs.CMPA.half.CMPA = duty*ref_sine_offset*EPwm5Regs.TBPRD;     // 50% modulation index
+    EPwm5Regs.CMPB = ref_sine_offset*0.75*EPwm5Regs.TBPRD;               // 75% modulation index
+
+    if ((ref_sine_n <= 0.005)&&(ref_sine_n >= -0.005)) // DEAD-BAND
+    {
+        GpioDataRegs.GPBCLEAR.bit.GPIO60 = 1;
+        GpioDataRegs.GPBCLEAR.bit.GPIO61 = 1;
+    }
+    if (ref_sine_n > 0.005) // POSITIVE CYCLE
+    {
+        GpioDataRegs.GPBSET.bit.GPIO60 = 1;
+        GpioDataRegs.GPBCLEAR.bit.GPIO61 = 1;
+    }
+    if (ref_sine_n < -0.005) // NEGATIVE CYCLE
+    {
+        GpioDataRegs.GPBCLEAR.bit.GPIO60 = 1;
+        GpioDataRegs.GPBSET.bit.GPIO61 = 1;
+    }
+
+
+    if (plot_count%40 == 1)
+    {
+        if (sample > 249)
+        sample = 0;
+        array_sine[sample][0] = theta_new*gain;
+        array_sine[sample][1] = td5*gain;
+        array_sine[sample][2] = sin_theta*gain;
+        array_sine[sample][3] = vg_alpha_new;
+        sample++;
+        plot_count = 1;
+    }
+    plot_count++;
+    time = time + 0.000025;
+    PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;
+}
+//===========================================================================
+// End of SourceCode.
+//===========================================================================
