@@ -1,1 +1,1 @@
-# switched-capacitor-inverter
+This project contains the various iterations of firmware that I have developed to run my reduced-switched-capacitor. Fell free to have a look. The microcontroller/DSP used for the hardware is TMS320F28335 by Texas Instruments. The firmware has been coded in Embedded-C using Code Composer Studio (CCS).
